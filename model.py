@@ -1,99 +1,48 @@
+'''
+Generative Pretrained Transformer (GPT)
+=======================================
+
+References:
+1) Original paper:
+   https://arxiv.org/abs/1706.03762
+2) Andrej Karpathy's implementation:
+   https://github.com/karpathy/nanoGPT/blob/master/model.py
+3) Andrej's YouTube lectures:
+   https://www.youtube.com/watch?v=kCc8FmEb1nY&t=4749s
+'''
+
 import torch
 import torch.nn as nn
-import sentencepiece as sp
+from dataclasses import dataclass
 
 
-torch.manual_seed(1000)
+@dataclass
+class ConfigGPT:
+    seq_size:   int = 64
+    vocab_size: int = 1000
+    num_layer:  int = 6
+    num_head:   int = 6
+    num_embed:  int = 180
+    dropout:    float = 0.0
+    device:     str = 'cpu'
 
-# Hyperparams
-batch_size = 256  # sequences evaluated in parallel
-block_size = 32  # time domain for predictions
-max_iters = 50000
-learning_rate = 2.5e-4
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_losses = 200
-eval_train = 500
-n_embed = 180
-n_head = 5
-n_layer = 3
-dropout = 0.3
-write_text = True
-text_log = []
-start_txt = 'Mati je bila '
-
-
-def print_me(text):
-    text_log.append(text)
-    print(text)
-
-
-print_me('GPT Training')
-print_me(f'Using {device} device for processing.')
-print_me('---------------')
-print_me(f'Batch Size: {batch_size}')
-print_me(f'Block Size: {block_size}')
-print_me(f'Num Embeddings: {n_embed}')
-print_me(f'Num Heads: {n_head}')
-print_me(f'Num Layers: {n_layer}')
-print_me(f'Learning rate: {learning_rate}')
-print_me(f'Train Iter: {max_iters}')
-print_me('---------------')
-
-# Get Cankar's prose
-with open('data/cankar/cankar-proza.txt') as f:
-    text = f.read()
-
-# Load tokenisation model
-token_model = sp.SentencePieceProcessor()
-token_model.load('cankar-tokens.model')
-vocab_size = token_model.vocab_size()
-
-# Train and test splits
-data = torch.tensor(token_model.encode_as_ids(text), dtype=torch.long)
-n = int(0.9*len(data))  # first 90% will be train, rest val
-train_data = data[:n]
-val_data = data[n:]
-
-
-#  data loading
-def get_batch(split):
-    # generate a small batch of data of inputs x and targets y
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
-
-
-#  evaluate loss on multiple runs
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_losses)
-        for k in range(eval_losses):
-            X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
+    def __post_init__(self):
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 class Head(nn.Module):
     '''Implementation of self-attention head.'''
 
-    def __init__(self, head_size):
+    def __init__(self, config):
         super().__init__()
-        self.key = nn.Linear(n_embed, head_size, bias=False)
-        self.query = nn.Linear(n_embed, head_size, bias=False)
-        self.value = nn.Linear(n_embed, head_size, bias=False)
+        head_size = config.num_embed // config.num_head
+        self.key = nn.Linear(config.num_embed, head_size, bias=False)
+        self.query = nn.Linear(config.num_embed, head_size, bias=False)
+        self.value = nn.Linear(config.num_embed, head_size, bias=False)
         # register buffer to be automatically transferred to gpu
         self.register_buffer('tril', torch.tril(
-            torch.ones(block_size, block_size)))
-        self.dropout = nn.Dropout(dropout)
+            torch.ones(config.seq_size, config.seq_size)))
+        self.dropout = nn.Dropout(config.dropout)
     
     def forward(self, input):
         # input (batch, time step, n_emb)
@@ -117,9 +66,11 @@ class Head(nn.Module):
 class MultiHeadAttention(nn.Module):
     '''Implementation of multiple heads of self attention.'''
 
-    def __init__(self, num_heads, head_size):
+    def __init__(self, config):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.heads = nn.ModuleList(
+            [Head(config) for _ in range(config.num_head)]
+        )
 
     def forward(self, input):
         return torch.cat([h(input) for h in self.heads], dim=-1)
@@ -128,13 +79,13 @@ class MultiHeadAttention(nn.Module):
 class FeedForward(nn.Module):
     '''Implements multi layer perceptron after attention.'''
 
-    def __init__(self, n_embed):
+    def __init__(self, config):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(n_embed, 4 * n_embed),
+            nn.Linear(config.num_embed, 4 * config.num_embed),
             nn.ReLU(),
-            nn.Linear(4 * n_embed, n_embed),
-            nn.Dropout(dropout),
+            nn.Linear(4 * config.num_embed, config.num_embed),
+            nn.Dropout(config.dropout),
         )
 
     def forward(self, x):
@@ -144,13 +95,12 @@ class FeedForward(nn.Module):
 class Block(nn.Module):
     '''Combines multi-head attention with MLP computation.'''
 
-    def __init__(self, n_embed, num_head):
+    def __init__(self, config):
         super().__init__()
-        head_size = n_embed // num_head
-        self.self_att = MultiHeadAttention(num_head, head_size)
-        self.feed_fwd = FeedForward(n_embed)
-        self.norm1 = nn.LayerNorm(n_embed)
-        self.norm2 = nn.LayerNorm(n_embed)
+        self.self_att = MultiHeadAttention(config)
+        self.feed_fwd = FeedForward(config)
+        self.norm1 = nn.LayerNorm(config.num_embed)
+        self.norm2 = nn.LayerNorm(config.num_embed)
 
     def forward(self, x):
         x = x + self.self_att(self.norm1(x))
@@ -161,15 +111,17 @@ class Block(nn.Module):
 class GPT(nn.Module):
     '''Implement bigram model, predicting next token.'''
 
-    def __init__(self):
+    def __init__(self, config: ConfigGPT):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
-        self.position_embedding_table = nn.Embedding(block_size, n_embed)
+        self.token_embed = nn.Embedding(config.vocab_size, config.num_embed)
+        self.position_embed = nn.Embedding(config.seq_size, config.num_embed)
         self.blocks = nn.Sequential(
-            *[Block(n_embed, n_head) for _ in range(n_layer)])
-        self.norm_last = nn.LayerNorm(n_embed)
-        self.linear_out = nn.Linear(n_embed, vocab_size)
+            *[Block(config) for _ in range(config.num_layer)])
+        self.norm_last = nn.LayerNorm(config.num_embed)
+        self.linear_out = nn.Linear(config.num_embed, config.vocab_size)
         self.apply(self._init_params)
+        self.device = config.device
+        self.seq_size = config.seq_size
 
     def _init_params(self, module):
         if isinstance(module, nn.Linear):
@@ -182,9 +134,9 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         B, T = idx.shape
         # idx and targets are both (B, T) tensor
-        tok_emb = self.token_embedding_table(idx)  # (B, T, C)
-        pos_emb = self.position_embedding_table(
-            torch.arange(T, device=device))  # (T, C)
+        tok_emb = self.token_embed(idx)  # (B, T, C)
+        pos_emb = self.position_embed(
+            torch.arange(T, device=self.device))  # (T, C)
         x = tok_emb + pos_emb  # (B, T, C)
         x = self.blocks(x)  # (B, T, C)
         x = self.norm_last(x)  # (B, T, C)
@@ -198,11 +150,12 @@ class GPT(nn.Module):
             loss = nn.functional.cross_entropy(logits, targets)
         return logits, loss
 
+    @torch.no_grad()
     def generate(self, idx, max_new_tokens):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
             # crop idx to the last block_size tokens
-            idx_cond = idx[:, -block_size:]
+            idx_cond = idx[:, -self.seq_size:]
             # get the predictions
             logits, loss = self(idx_cond)
             # focus only on the last time step
@@ -214,47 +167,3 @@ class GPT(nn.Module):
             # append sampled index to the running sequence
             idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
         return idx
-
-
-# instantiate model
-model = GPT()
-m = model.to(device)
-
-# print num of parameters
-no_params = sum(p.numel() for p in m.parameters())
-print_me(f'Model using {no_params/1e6:.2f}M paramaters.')
-print_me(f'Training on {len(data)/1e6:.2f}M tokens.')
-print_me('---------------')
-
-# create optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-
-for iter in range(max_iters):
-    # print loss
-    if iter % eval_train == 0 or iter == max_iters-1:
-        losses = estimate_loss()
-        print_me(f"Iter: {iter}, Train Loss: {losses['train']:.4f}, " +
-                 f"Validation Loss: {losses['val']:.4f}")
-
-    # get new sampled data
-    x, y = get_batch('train')
-
-    # evaluate the loss
-    logits, loss = model(x, y)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step() 
-
-# generate new text from model
-print_me('---------------')
-print_me('Sample output:')
-# context = torch.zeros((1, 1), dtype=torch.long, device=device)
-start_ids = token_model.encode_as_ids(start_txt)
-context = torch.tensor(start_ids, dtype=torch.long, device=device).unsqueeze(0)
-
-text = token_model.decode_ids(
-    m.generate(context, max_new_tokens=10000)[0].tolist())
-print(text[:500])
-if write_text:
-    text = '\n'.join(text_log) + '\n' + text
-    open('more.txt', 'w').write(text)
