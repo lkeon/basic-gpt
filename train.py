@@ -1,25 +1,30 @@
 '''
 Train a GPT Model
-=================
 '''
 
 import torch
 import sentencepiece as sp
-import os.path
+import os
 from model import ConfigGPT, GPT
 
 
 # Hyperparams
 batch_size = 256  # sequences evaluated in parallel
-max_iters = 5
+max_iters = 4000
 learning_rate = 2.5e-4
 eval_losses = 200
 eval_train = 500
 write_text = True
 text_log = []
-start_txt = 'Mati je bila '
-in_file = 'data/cankar-proza.txt'
+start_txt = 'A house was '
+in_file = 'data/bookcorpus.txt'
 out_file = 'out.txt'
+out_dir = 'out'
+
+
+if not os.path.isdir(out_dir):
+    os.mkdir(out_dir)
+    print(f'Output directory \'{out_dir}\' created.')
 
 
 def print_me(text):
@@ -29,7 +34,7 @@ def print_me(text):
 
 # Instantiate default config
 print_me('GPT Training')
-config = ConfigGPT()
+config = ConfigGPT(vocab_size=4000)
 print(repr(config))
 
 # Get text
@@ -37,7 +42,7 @@ with open(in_file) as f:
     text = f.read()
 
 # Load tokenisation model
-if not os.path.isfile('sp-tokens.model'):
+if not os.path.isfile(os.path.join(out_dir, 'sp-tokens.model')):
     # Train sentencepiece model on input data
     sp.SentencePieceTrainer.train(f'--input={in_file} \
                                     --model_prefix=sp-tokens \
@@ -45,6 +50,7 @@ if not os.path.isfile('sp-tokens.model'):
 
 token_model = sp.SentencePieceProcessor()
 token_model.load('sp-tokens.model')
+print('Tokenization loaded.')
 
 # Train and test splits
 data = torch.tensor(token_model.encode_as_ids(text), dtype=torch.long)
@@ -92,13 +98,26 @@ print_me('---------------')
 
 # create optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+best_loss = float('inf')
 
-for iter in range(max_iters):
+for itr in range(max_iters):
     # print loss
-    if iter % eval_train == 0 or iter == max_iters-1:
+    if itr % eval_train == 0 or itr == max_iters-1:
         losses = estimate_loss()
-        print_me(f"Iter: {iter}, Train Loss: {losses['train']:.4f}, " +
+        print_me(f"Iter: {itr}, Train Loss: {losses['train']:.4f}, " +
                  f"Validation Loss: {losses['val']:.4f}")
+
+        # Save checkpoint
+        if losses['val'] < best_loss:
+            checkpoint = {
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'iter': itr,
+                'best_val_loss': best_loss,
+                'config_dict': config.__dict__,
+            }
+            torch.save(checkpoint, os.path.join(out_dir, 'checkpoint.pt'))
+            print(f'Checkpoint saved to \'{out_dir}\'.')
 
     # get new sampled data
     x, y = get_batch('train')
@@ -122,4 +141,4 @@ text = token_model.decode_ids(
 print(text[:500])
 if write_text:
     text = '\n'.join(text_log) + '\n' + text
-    open(out_file, 'w').write(text)
+    open(os.path.join(out_dir, out_file), 'w').write(text)

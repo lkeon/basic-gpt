@@ -1,6 +1,5 @@
 '''
 Generative Pretrained Transformer (GPT)
-=======================================
 
 References:
 1) Original paper:
@@ -29,20 +28,28 @@ class ConfigGPT:
     def __post_init__(self):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+    @property
+    def head_size(self):
+        return self.num_embed // self.num_head
+
 
 class Head(nn.Module):
     '''Implementation of self-attention head.'''
 
     def __init__(self, config):
         super().__init__()
-        head_size = config.num_embed // config.num_head
-        self.key = nn.Linear(config.num_embed, head_size, bias=False)
-        self.query = nn.Linear(config.num_embed, head_size, bias=False)
-        self.value = nn.Linear(config.num_embed, head_size, bias=False)
-        # register buffer to be automatically transferred to gpu
-        self.register_buffer('tril', torch.tril(
-            torch.ones(config.seq_size, config.seq_size)))
-        self.dropout = nn.Dropout(config.dropout)
+        self.key = nn.Linear(config.num_embed, config.head_size, bias=False)
+        self.query = nn.Linear(config.num_embed, config.head_size, bias=False)
+        self.value = nn.Linear(config.num_embed, config.head_size, bias=False)
+        self.dropout_p = config.dropout
+        # Use pytorch flash attention if available
+        self.flash_att = hasattr(nn.functional, 'scaled_dot_product_attention')
+        if not self.flash_att:
+            print('WARNING: No flash Attention available, using slow version.')
+            self.dropout = nn.Dropout(self.dropout_p)
+            # register buffer to be automatically transferred to gpu
+            self.register_buffer('tril', torch.tril(
+                torch.ones(config.seq_size, config.seq_size)))
     
     def forward(self, input):
         # input (batch, time step, n_emb)
@@ -50,16 +57,25 @@ class Head(nn.Module):
         B, T, C = input.shape
         k = self.key(input)    # (B, T, head size)
         q = self.query(input)  # (B, T, head size)
-        # compute attention using dot product
-        weights = q @ k.transpose(-2, -1)  # (B,T,hs) @ (B,hs,T) -> (B,T,T)
-        # normalise variance before softmax
-        weights = weights * k.shape[-1]**-0.5
-        weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        weights = nn.functional.softmax(weights, dim=-1)
-        weights = self.dropout(weights)
-        # perform weighted aggregation of values
         v = self.value(input)  # (B, T, head size)
-        out = weights @ v  # (B, T, T) @ (B, T, head size) -> (B, T, head size)
+
+        if self.flash_att:
+            # Perform Pytorch Flash Attention
+            out = nn.functional.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.dropout_p if self.training else 0,
+                is_causal=True)
+        else:
+            # compute attention using dot product
+            weights = q @ k.transpose(-2, -1)  # (B,T,hs) @ (B,hs,T) -> (B,T,T)
+            # normalise variance before softmax
+            weights = weights * k.shape[-1]**-0.5
+            weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+            weights = nn.functional.softmax(weights, dim=-1)
+            weights = self.dropout(weights)
+            # perform weighted aggregation of values
+            out = weights @ v  # (B, T, T) @ (B, T, head size) -> (B, T, head size)
         return out
 
 
@@ -68,12 +84,14 @@ class MultiHeadAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.heads = nn.ModuleList(
-            [Head(config) for _ in range(config.num_head)]
-        )
+        self.heads = nn.ModuleList([Head(config) for _ in range(config.num_head)])
+        self.lin_proj = nn.Linear(config.head_size * config.num_head, config.num_embed)
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, input):
-        return torch.cat([h(input) for h in self.heads], dim=-1)
+        out = torch.cat([h(input) for h in self.heads], dim=-1)
+        out = self.dropout(self.lin_proj(out))
+        return out
 
 
 class FeedForward(nn.Module):
