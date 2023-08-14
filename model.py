@@ -75,7 +75,7 @@ class Head(nn.Module):
             weights = nn.functional.softmax(weights, dim=-1)
             weights = self.dropout(weights)
             # perform weighted aggregation of values
-            out = weights @ v  # (B, T, T) @ (B, T, head size) -> (B, T, head size)
+            out = weights @ v  # (B, T, T)@(B, T, head size)->(B, T, head size)
         return out
 
 

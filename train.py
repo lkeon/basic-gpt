@@ -10,8 +10,8 @@ from model import ConfigGPT, GPT
 
 # Hyperparams
 batch_size = 256  # sequences evaluated in parallel
-max_iters = 4000
-learning_rate = 2.5e-4
+max_epochs = 500
+learning_rate = 2.5e-5
 eval_losses = 200
 eval_train = 500
 write_text = True
@@ -20,6 +20,7 @@ start_txt = 'A house was '
 in_file = 'data/bookcorpus.txt'
 out_file = 'out.txt'
 out_dir = 'out'
+init_model = 'new'  # use 'new'/'resume'
 
 
 if not os.path.isdir(out_dir):
@@ -35,7 +36,6 @@ def print_me(text):
 # Instantiate default config
 print_me('GPT Training')
 config = ConfigGPT(vocab_size=4000)
-print(repr(config))
 
 # Get text
 with open(in_file) as f:
@@ -45,14 +45,14 @@ with open(in_file) as f:
 if not os.path.isfile(os.path.join(out_dir, 'sp-tokens.model')):
     # Train sentencepiece model on input data
     sp.SentencePieceTrainer.train(f'--input={in_file} \
-                                    --model_prefix=sp-tokens \
+                                    --model_prefix={out_dir}/sp-tokens \
                                     --vocab_size={config.vocab_size}')
 
 token_model = sp.SentencePieceProcessor()
-token_model.load('sp-tokens.model')
+token_model.load(f'{out_dir}/sp-tokens.model')
 print('Tokenization loaded.')
 
-# Train and test splits
+# Train and test splits  
 data = torch.tensor(token_model.encode_as_ids(text), dtype=torch.long)
 n = int(0.9*len(data))  # first 90% will be train, rest val
 train_data = data[:n]
@@ -87,7 +87,19 @@ def estimate_loss():
 
 
 # instantiate model
-model = GPT(config)
+if init_model == 'new':
+    model = GPT(config)
+    best_loss = float('inf')
+elif init_model == 'resume':
+    check_path = os.path.join(out_dir, 'checkpoint.pt')
+    checkpoint = torch.load(check_path, map_location=config.device)
+    config_dict = checkpoint['config_dict']
+    config = ConfigGPT(**config_dict)
+    model = GPT(config)
+    model.load_state_dict(checkpoint['model'])
+    best_loss = checkpoint['best_val_loss']
+
+print(repr(config))    
 m = model.to(config.device)
 
 # print num of parameters
@@ -98,26 +110,33 @@ print_me('---------------')
 
 # create optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-best_loss = float('inf')
+scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+if init_model == 'resume':
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    scheduler.load_state_dict(checkpoint['scheduler'])
+    checkpoint = None  # free up memory
 
-for itr in range(max_iters):
+for epoch in range(max_epochs):
     # print loss
-    if itr % eval_train == 0 or itr == max_iters-1:
+    if epoch % eval_train == 0 or epoch == max_epochs-1:
         losses = estimate_loss()
-        print_me(f"Iter: {itr}, Train Loss: {losses['train']:.4f}, " +
-                 f"Validation Loss: {losses['val']:.4f}")
+        print_me(f"Iter: {epoch}, Train Loss: {losses['train']:.4f}, " +
+                 f"Validation Loss: {losses['val']:.4f}, " +
+                 f"Learning Rate: {scheduler.get_last_lr()[0]:.4e}")
 
         # Save checkpoint
         if losses['val'] < best_loss:
             checkpoint = {
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'iter': itr,
+                'scheduler': scheduler.state_dict(),
+                'iter': epoch,
                 'best_val_loss': best_loss,
                 'config_dict': config.__dict__,
             }
-            torch.save(checkpoint, os.path.join(out_dir, 'checkpoint.pt'))
+            # torch.save(checkpoint, os.path.join(out_dir, 'checkpoint.pt'))
             print(f'Checkpoint saved to \'{out_dir}\'.')
+            best_loss = losses['val']
 
     # get new sampled data
     x, y = get_batch('train')
@@ -126,7 +145,8 @@ for itr in range(max_iters):
     logits, loss = model(x, y)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
-    optimizer.step() 
+    optimizer.step()
+    scheduler.step()
 
 # generate new text from model
 print_me('---------------')
